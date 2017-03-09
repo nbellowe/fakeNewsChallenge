@@ -1,0 +1,309 @@
+from csv import DictReader, DictWriter
+
+import numpy as np
+from numpy import array
+
+from argparse import ArgumentParser
+
+from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
+from sklearn.linear_model import SGDClassifier
+from sklearn.model_selection import cross_val_score
+from sklearn import metrics
+from sklearn.preprocessing import FunctionTransformer
+from sklearn.pipeline import FeatureUnion, Pipeline
+
+from collections import defaultdict
+import string
+import re
+
+import nltk
+from nltk.tokenize import word_tokenize
+from nltk.tag import pos_tag
+from nltk.chunk import ne_chunk
+from nltk.stem.porter import PorterStemmer
+
+from scipy.sparse import hstack
+
+kTARGET_FIELD = 'spoiler'
+kTEXT_FIELD = 'sentence'
+kPAGE_FIELD = 'page'
+kTROPE_FIELD = 'trope'
+NAME_TOKEN = "NAMETOKEN"
+
+
+def tree(): return defaultdict(tree)
+
+from nltk.stem import WordNetLemmatizer
+
+
+class LemmaTokenizer(object):
+
+    def __init__(self):
+        self.wnl = WordNetLemmatizer()
+
+    def __call__(self, doc):
+        return [self.wnl.lemmatize(t) for t in word_tokenize(doc)]
+
+
+class PorterStemmerTokenizer(object):
+
+    def __init__(self):
+        self.stemmer = PorterStemmer()
+
+    def __call__(self, text):
+        return [self.stemmer.stem(item) for item in word_tokenize(text)]
+
+def getTrope(x):
+    return re.sub(r"(\w)([A-Z])", r"\1 \2", x[kTROPE_FIELD])
+
+
+class Featurizer:
+
+    def __init__(self, vectorizer, tropevectorizer=None, pagevectorizer=None):
+        words = ('bag of words',
+                 Pipeline([('extract_field', FunctionTransformer(lambda all: [x[kTEXT_FIELD] for x in all], validate=False)), ('tfidf', vectorizer)]))
+
+        if pagevectorizer != None:
+            pagevectorizer = ('page name', Pipeline([
+                     ('extract_field', FunctionTransformer( lambda all: [x[kPAGE_FIELD] for x in all], validate=False)),
+                     ('trope_count', pagevectorizer)
+                 ]))
+
+        if tropevectorizer != None:
+            tropevectorizer = ('trope name', Pipeline([
+                ('extract_field', FunctionTransformer(lambda all: [getTrope(x) for x in all], validate=False)),
+                ('trope_count', tropevectorizer)
+            ]))
+
+        self.vectorizer = FeatureUnion(
+            x for x in [words, tropevectorizer, pagevectorizer] if x is not None)
+
+    def train_feature(self, examples):
+        return self.vectorizer.fit_transform(examples)
+
+    def test_feature(self, examples):
+        return self.vectorizer.transform(examples)
+
+
+def process_sentence(sentence):
+
+    def remove_names(sentence):
+
+        def get_names(parent):
+            sentence = []
+            for node in parent:
+                if type(node) is nltk.Tree:
+                    if node.label() == "PERSON":
+                        sentence.append(node[0][0])
+                        continue
+                    sentence.extend(get_names(node))
+            return sentence
+
+        sentence_tree = ne_chunk(pos_tag(word_tokenize(sentence)))
+        names = get_names(sentence_tree)
+        for name in names:
+            sentence = sentence.replace(name, NAME_TOKEN)
+        return sentence
+
+    sentence = remove_names(sentence)
+    sentence = sentence.lower()
+    sentence = sentence.translate(None, string.punctuation)
+    return sentence
+
+
+def run(train, test,
+        vectorizer, ngrams,
+        char,
+        analyzers, stop_words,
+        crossvalidate,
+        debug=True,
+        tropevectorizer=False,
+        pagevectorizer=False,
+        tokenized=False):
+    # Cast to list to keep it all in memory
+    ngram_range = ngram_range = (1, ngrams) if ngrams > 0 else None
+    stop_words = "english" if stop_words is True else None
+    analyzer = "char" if char else "word"
+    print "Vectorizer:", vectorizer, ", ngrams:", ngrams, ((", " + stop_words + " stopwords") if stop_words else ""),  ((", trope vectorizer" if tropevectorizer else "")), ((", page vectorizer" if pagevectorizer else "")), (", tokenized with " + tokenized if tokenized else "")
+
+    tokenizer = None
+    if tokenized == "lemma":
+        tokenizer = LemmaTokenizer()
+    if tokenized == "porter":
+        tokenizer = PorterStemmerTokenizer()
+
+    if vectorizer == "count":
+        vectorizer = CountVectorizer(
+            ngram_range=ngram_range, analyzer=analyzer, stop_words=stop_words, tokenizer=tokenizer)
+    elif vectorizer == "tfifd":
+        vectorizer = TfidfVectorizer(
+            ngram_range=ngram_range, analyzer=analyzer, stop_words=stop_words, tokenizer=tokenizer)
+    elif vectorizer == "tf":
+        vectorizer = TfidfVectorizer(
+            use_idf=False, ngram_range=ngram_range, analyzer=analyzer, stop_words=stop_words, tokenizer=tokenizer)
+    else:
+        print "Wrong vectorizer, found %s" % vectorizer
+        return
+
+    tropevectorizer = CountVectorizer() if tropevectorizer else None
+    pagevectorizer = CountVectorizer() if pagevectorizer else None
+    feat = Featurizer(vectorizer, tropevectorizer, pagevectorizer)
+
+    labels = []
+    for line in train:
+        if not line[kTARGET_FIELD] in labels:
+            labels.append(line[kTARGET_FIELD])
+
+    x_train = feat.train_feature(train)
+    x_test = feat.test_feature(test)
+
+    y_train = array(list(labels.index(x[kTARGET_FIELD])
+                         for x in train))
+    print("Training set is ", x_train.shape)
+    print("Testing data is ", x_test.shape)
+
+    # Train classifier
+    lr = SGDClassifier(loss='log', penalty='l2', shuffle=True)
+    accuracy = None
+    if crossvalidate:
+        scores = cross_val_score(lr, x_train, y_train, cv=5)
+        accuracy = scores.mean()
+        print "Crossvalidation", scores, ("Accuracy: %0.2f (+/- %0.2f)" % (accuracy, scores.std() * 2))
+        lr = SGDClassifier(loss='log', penalty='l2', shuffle=True)
+
+    lr.fit(x_train, y_train)
+
+    if debug:
+        feat.show_top10(lr, labels)
+
+    predictions = lr.predict(x_test)
+
+    o = DictWriter(open("predictions.csv", 'w'), ["Id", "spoiler"])
+    o.writeheader()
+    for ii, pp in zip([x['Id'] for x in test], predictions):
+        d = {'Id': ii, 'spoiler': labels[pp]}
+        o.writerow(d)
+
+    return accuracy
+
+def processNames(l):
+    print "..."
+    print "Processing text"
+    print "..."
+    for elem in l:
+        elem[kTEXT_FIELD] = process_sentence(elem[kTEXT_FIELD])
+    print "Finished processing text"
+    print "..."
+
+if __name__ == "__main__":
+    argparser = ArgumentParser()
+    argparser.add_argument( "--train_path", help="Training path",
+        type=str, default="../data/spoilers/train.csv", required=False)
+
+    argparser.add_argument( "--test_path", help="Training path",
+        type=str, default="../data/spoilers/test.csv", required=False)
+
+    argparser.add_argument( "--vectorizer", help="Vectorizer, [tfifd, tf, count]",
+        type=str, default="tfifd", required=False)
+
+    argparser.add_argument( "--ngrams", help="Length of ngrams to use",
+        type=int, default=4, required=False)
+
+    argparser.add_argument( "--char", help="by character",
+        action="append", required=False)
+
+    argparser.add_argument( "--stop_words", help="whether to use stopwords",
+        action="store_true")
+
+    argparser.add_argument( "--runall", help="run all",
+        action="store_true")
+
+    argparser.add_argument( "--pagevectorizer", help="use a page featurizer",
+        action="store_true")
+
+    argparser.add_argument( "--tropevectorizer", help="use a trope featurizer",
+        action="store_true")
+
+    argparser.add_argument( "--tokenized", help="use a tokenizer [lemma, porter]",
+        type=str, default="", required=False)
+
+    argparser.add_argument( "--debug", help="debug",
+        type=bool, default=False)
+
+    argparser.add_argument( "--preprocessNames", help="preprocess",
+        type=bool, default=False)
+
+    args = argparser.parse_args()
+
+    train = list(DictReader(open(args.train_path, 'r')))
+    test = list(DictReader(open(args.test_path, 'r')))
+    if not args.runall:
+        if args.preprocessNames:
+            for l in [train, test]:
+                processNames(l)
+
+        predictions = run(
+            train=train, test=test,
+            vectorizer=args.vectorizer,
+            stop_words=args.stop_words,
+            char=args.char,
+            analyzers=None,
+            ngrams=args.ngrams,
+            crossvalidate=True,
+            debug=args.debug,
+            tropevectorizer=args.tropevectorizer,
+            pagevectorizer=args.pagevectorizer,
+            tokenized=args.tokenized
+        )
+    else:
+        results = tree()
+        vectorizers = ["tf", "tfidf", "count"]
+        tropes = [True, False]
+        pages = [True, False]
+        ngrams = [1, 2, 4, 8]
+        stop_words_s = [True, False]
+        tokenizers=["lemma", "porter", ""]
+        preprocessNames_s = ["Unprocessed", "Preprocessed"]
+
+        total = len(vectorizers) * len(tropes) * len(pages) * len(ngrams) * len(stop_words_s) * len(tokenizers) * len(preprocessNames_s)
+        current = 0
+
+        o = DictWriter(open("results.csv", 'w'), [
+                       "Processed", "Vectorizer", "Ngrams", "StopWords", "Trope featurizer", "Page featurizer", "Tokenized", "Accuracy"])
+        o.writeheader()
+        for preprocessNames in preprocessNames_s:
+            if preprocessNames == "Preprocessed":
+                for l in [train, test]:
+                    processNames(l)
+
+            for vectorizer in vectorizers:
+                for trope in tropes:
+                    for page in pages:
+                        for ngram in ngrams:
+                            for stop_words in stop_words_s:
+                                for tokenized in tokenizers:
+                                    current += 1
+                                    print(current, total, float(current)/total)
+                                    accuracy = run(
+                                        train=train, test=test,
+                                        vectorizer=vectorizer,
+                                        stop_words=stop_words,
+                                        char=False,
+                                        analyzers=None,
+                                        ngrams=ngram,
+                                        crossvalidate=True,
+                                        debug=False,
+                                        tropevectorizer=trope,
+                                        pagevectorizer=page,
+                                        tokenized=tokenized
+                                    )
+                                    o.writerow({
+                                        "Processed": preprocessNames,
+                                        "Vectorizer": vectorizer,
+                                        "Ngrams": ngram,
+                                        "StopWords": stop_words,
+                                        "Page featurizer": page,
+                                        "Trope featurizer": trope,
+                                        "Tokenized": tokenized,
+                                        "Accuracy": accuracy
+                                    })
